@@ -132,6 +132,44 @@ import math
 import pandas as pd
 import streamlit as st
 
+def unassigned_explanation(row):
+    missing = [METRICS[k][0] for k in METRICS if pd.isna(row.get(k))]
+    original = str(row.get('eligibility_reason', ''))
+    reasons = []
+    if 'financial company' in original:
+        reasons.append('Financial company: a separate scoring model is required.')
+    if 'nonpositive book equity' in original:
+        reasons.append('Nonpositive book equity: the current valuation method needs a separate treatment.')
+    if 'stale' in original:
+        reasons.append('Outdated or unavailable statement date: more recent financial data is needed.')
+    if missing:
+        reasons.append('Insufficient data: ' + str(len(missing)) + ' required metric(s) are missing or undefined.')
+    if 'too few' in original:
+        reasons.append('Too few eligible sector peers: at least five are required for comparison.')
+    if 'sector unavailable' in original:
+        reasons.append('Sector unavailable: the comparison group cannot be identified.')
+    if 'financial company' in original:
+        primary = 'Separate financial-sector model'
+    elif 'nonpositive book equity' in original:
+        primary = 'Nonpositive book equity'
+    elif 'stale' in original:
+        primary = 'Outdated financial data'
+    elif missing:
+        primary = 'Insufficient data'
+    elif 'too few' in original:
+        primary = 'Too few sector peers'
+    else:
+        primary = 'Other eligibility issue'
+    return {
+        'Ticker': row['ticker'], 'Company': row['company_name'], 'Sector': row['sector'],
+        'Data status': 'Insufficient data' if missing else 'Complete metric data',
+        'Primary reason': primary, 'Metrics available': 11-len(missing),
+        'Missing metrics': ', '.join(missing) if missing else 'None',
+        'Why not assigned': ' '.join(reasons) if reasons else original,
+        'Fiscal period ended': row['period_end'],
+    }
+
+
 ROOT=Path(__file__).resolve().parent
 st.set_page_config(page_title='Long / Short Lab',page_icon='📊',layout='wide')
 
@@ -216,7 +254,7 @@ for col,label,title in zip(cols[1:],CLASSES,['Long candidates','Short candidates
 
 mode='Recalculated within filtered companies' if config['rerank'] else 'Original sector rankings'
 st.caption(f"Applied: {len(config['sectors'])} sectors · {len(config['ranges'])} metric filters · {mode} · Top/bottom {config['tail']}%")
-results_tab,detail_tab,method_tab=st.tabs(['Company list','Company detail','How scoring works'])
+results_tab,detail_tab,unassigned_tab,method_tab=st.tabs(['Company list','Company detail','Unassigned companies','How scoring works'])
 
 with results_tab:
     if view.empty:
@@ -256,7 +294,7 @@ with detail_tab:
         st.subheader(f"{ticker} · {row['company_name']}")
         st.write(f"**{row['classification']}** · {row['sector']} · Fiscal period ended {row['period_end']}")
         if row['classification']=='Not assigned':
-            st.info(str(row['eligibility_reason']))
+            st.info(unassigned_explanation(dict(row, ticker=ticker))['Why not assigned'])
         else:
             chart=pd.DataFrame({'Category':['Valuation','Profitability','Earnings quality','Financial strength'],
                 'Score':[row[g+'_score'] for g in ['valuation','profitability','earnings_quality','financial_strength']]}).set_index('Category')
@@ -269,6 +307,48 @@ with detail_tab:
         st.dataframe(pd.DataFrame(values),hide_index=True,width='stretch')
         if pd.notna(row.get('review_flags')) and row['review_flags']:
             st.caption('Data review: '+str(row['review_flags']))
+
+with unassigned_tab:
+    st.subheader('Why companies are not assigned')
+    st.write('A company is not assigned when the model does not have enough usable data or the company needs a different scoring treatment. This is not a short recommendation or evidence of poor performance.')
+    st.caption('This view covers the full 500-company dataset using the original sector comparison. Use the filters below; the sidebar filters apply to Company list and Company detail.')
+    unassigned_rows = baseline.loc[baseline.classification.eq('Not assigned')]
+    explanations = pd.DataFrame([unassigned_explanation(row) for _,row in unassigned_rows.iterrows()])
+    summary_cols = st.columns(3)
+    summary_cols[0].metric('Unassigned in full dataset', len(explanations))
+    summary_cols[1].metric('With insufficient data', int(explanations['Data status'].eq('Insufficient data').sum()))
+    summary_cols[2].metric('Complete metrics, other blocker', int(explanations['Data status'].eq('Complete metric data').sum()))
+    with st.expander('What does insufficient data mean?', expanded=True):
+        st.markdown('**Insufficient data** means at least one of the 11 required metrics is unavailable or cannot be calculated under the current rules. It does not mean the metric is zero or that the company is a bad investment.\n\nExamples include missing statement fields, an incomplete F-score, too little annual history, an undefined margin-growth rate, or a tax/capital denominator that prevents after-tax ROC. Some companies also have a separate eligibility issue.\n\nOther reasons for no assignment include a financial-sector business requiring its own model, nonpositive book equity, outdated financial statements, or fewer than five eligible sector peers.')
+    filters_left, filters_right = st.columns(2)
+    data_status = filters_left.selectbox('Data availability', ['All', 'Insufficient data', 'Complete metric data'], key='unassigned_status')
+    reason = filters_right.selectbox('Primary reason', ['All'] + sorted(explanations['Primary reason'].unique().tolist()), key='unassigned_reason')
+    unassigned_sectors = st.multiselect('Unassigned company sectors', sorted(explanations.Sector.dropna().unique().tolist()), default=sorted(explanations.Sector.dropna().unique().tolist()), key='unassigned_sectors')
+    unassigned_search = st.text_input('Search unassigned companies', placeholder='Company or ticker', key='unassigned_search')
+    shown = explanations[explanations.Sector.isin(unassigned_sectors)].copy()
+    if data_status != 'All':
+        shown = shown[shown['Data status'].eq(data_status)]
+    if reason != 'All':
+        shown = shown[shown['Primary reason'].eq(reason)]
+    if unassigned_search.strip():
+        q=unassigned_search.strip()
+        shown=shown[shown.Ticker.str.contains(q,case=False,regex=False) | shown.Company.fillna('').str.contains(q,case=False,regex=False)]
+    st.caption(f'{len(shown)} unassigned companies match these filters. Primary reason shows one main blocker; Why not assigned includes all identified blockers.')
+    if shown.empty:
+        st.info('No unassigned companies match these filters.')
+    else:
+        st.dataframe(shown.sort_values('Ticker'),hide_index=True,width='stretch',column_config={
+            'Metrics available':st.column_config.NumberColumn('Metrics available (of 11)',format='%d'),
+            'Why not assigned':st.column_config.TextColumn('Why not assigned',width='large'),
+            'Missing metrics':st.column_config.TextColumn('Missing metrics',width='large'),
+        })
+        inspect_unassigned = st.selectbox('Explain an unassigned company', shown.Ticker.sort_values().tolist(),key='unassigned_inspect')
+        selected_reason = shown.set_index('Ticker').loc[inspect_unassigned]
+        st.markdown(f"**{inspect_unassigned} · {selected_reason['Company']}**")
+        st.write(selected_reason['Why not assigned'])
+        st.write('**Missing metrics:** ' + selected_reason['Missing metrics'])
+        st.caption(f"Available metrics: {selected_reason['Metrics available']}/11. These results use the existing eligibility rules; no missing values have been filled with zero.")
+        st.download_button('Download unassigned company explanations',shown.to_csv(index=False).encode('utf-8'),file_name='unassigned_explanations.csv',mime='text/csv')
 
 with method_tab:
     st.markdown('''
