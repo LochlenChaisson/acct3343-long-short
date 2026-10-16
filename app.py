@@ -1,4 +1,4 @@
-# Long / Short Lab — standalone Streamlit app
+# Long Analysis Lab — standalone Streamlit app
 # Upload this file as app.py to GitHub; no data folder or other source files needed.
 # Deploy with app.py as the main file. Uses Streamlit, pandas and NumPy.
 # Embedded dataset: reviewed 500-company snapshot from October 16, 2026.
@@ -32,9 +32,10 @@ def percentile(series, higher_better=True):
     return (series.rank(method='average', ascending=higher_better)-1)/(len(series)-1)*100
 
 
-def score(frame, tail=20, min_peers=5):
+def score(frame, tail=20, min_peers=5, buy_rules=None):
     if not 0 < tail < 50 or min_peers < 2:
         raise ValueError('Require 0 < tail < 50 and min_peers >= 2')
+    buy_rules = buy_rules or dict(valuation=50, profitability=50, strength=40, positive=True)
     df=frame.copy()
     # User-confirmed slide coefficients, with decimal X inputs.
     df['z_score_class']=sum(c*pd.to_numeric(df[f'z_x{i}'],errors='coerce')
@@ -45,6 +46,8 @@ def score(frame, tail=20, min_peers=5):
     reasons=[]
     for _,r in df.iterrows():
         why=[]
+        if str(r['ticker']).upper() == 'CROX':
+            why.append('assignment exclusion: Crocs was used for the 60-second pitch')
         if pd.isna(r['sector']) or not str(r['sector']).strip():
             why.append('sector unavailable')
         if r['sector'] in ['Financials','Financial Services']:
@@ -78,9 +81,14 @@ def score(frame, tail=20, min_peers=5):
     df['sector_composite_percentile']=np.nan
     df.loc[eligible.index,'sector_composite_percentile']=df.loc[eligible.index].groupby('sector')['overall_score'].transform(percentile)
     df['classification']='Not assigned'
-    df.loc[df.eligible,'classification']='Neutral'
-    df.loc[df.eligible & df.sector_composite_percentile.ge(100-tail),'classification']='Long candidate'
-    df.loc[df.eligible & df.sector_composite_percentile.le(tail),'classification']='Short candidate'
+    df.loc[df.eligible,'classification']='Does not meet selected criteria'
+    qualifies = (df.eligible & df.sector_composite_percentile.ge(100-tail)
+                 & df.valuation_score.ge(buy_rules['valuation'])
+                 & df.profitability_score.ge(buy_rules['profitability'])
+                 & df.financial_strength_score.ge(buy_rules['strength']))
+    if buy_rules['positive']:
+        qualifies &= df.earnings_yield_class_snapshot.gt(0) & df.roc_after_tax.gt(0)
+    df.loc[qualifies,'classification']='Long candidate'
     df['sector_rank']=np.nan
     df.loc[eligible.index,'sector_rank']=df.loc[eligible.index].groupby('sector').overall_score.rank(ascending=False,method='min')
     return df
@@ -102,28 +110,55 @@ METRICS = {
     'margin_growth_rate': ('Margin growth (%)', 100., 'Annual geometric growth'),
     'margin_stability': ('Margin stability', 1., 'Average gross margin / sample standard deviation'),
 }
-CLASSES = ['Long candidate', 'Short candidate', 'Neutral', 'Not assigned']
+CLASSES = ['Long candidate', 'Does not meet selected criteria', 'Not assigned']
+
+
+def checks_for(row, config):
+    rules=config.get('buy_rules', dict(valuation=50,profitability=50,strength=40,positive=True))
+    tests = [
+        ('Sector composite percentile', row['sector_composite_percentile'], 100-config.get('tail',20), '>='),
+        ('Valuation score', row['valuation_score'], rules['valuation'], '>='),
+        ('Profitability score', row['profitability_score'], rules['profitability'], '>='),
+        ('Financial strength score', row['financial_strength_score'], rules['strength'], '>='),
+    ]
+    if rules['positive']:
+        tests += [('Earnings yield (%)',row['earnings_yield_class_snapshot']*100,0,'>'),
+                  ('After-tax ROC (%)',row['roc_after_tax']*100,0,'>')]
+    return pd.DataFrame([{'Criterion':name,'Company value':value,'Required':f'{op} {limit:g}',
+                         'Result': 'Unavailable' if pd.isna(value) else 'Pass' if (value>=limit if op=='>=' else value>limit) else 'Fail'}
+                        for name,value,limit,op in tests])
+
+
+def conclusion(row, config):
+    if not row['eligible']:
+        return 'Not assigned: '+str(row['eligibility_reason'])
+    checks=checks_for(row,config)
+    failed=checks.loc[checks.Result.ne('Pass'),'Criterion'].tolist()
+    if failed:
+        return 'Does not qualify for the long screen. Failed: '+', '.join(failed)+'.'
+    return (f"Potential BUY for further research: passes the top {config.get('tail',20)}% sector threshold "
+            f"and all selected long requirements. Valuation {row['valuation_score']:.1f}/100; "
+            f"profitability {row['profitability_score']:.1f}/100; financial strength {row['financial_strength_score']:.1f}/100. "
+            f"Earnings yield {row['earnings_yield_class_snapshot']*100:.2f}%; after-tax ROC {row['roc_after_tax']*100:.2f}%.")
 
 
 def run_screen(data, config):
-    """Ranges, sector and search precede optional rerank; class/score follow it."""
-    baseline = score(data, tail=config.get('tail',20))
+    rules=config.get('buy_rules')
+    baseline = score(data, tail=config.get('tail',20),buy_rules=rules)
     universe = baseline[baseline.sector.isin(config['sectors'])].copy()
-    query = config.get('search','').strip()
-    if query:
-        matches = universe.ticker.fillna('').str.contains(query,case=False,regex=False)
-        matches |= universe.company_name.fillna('').str.contains(query,case=False,regex=False)
-        universe = universe[matches].copy()
     for metric, bounds in config.get('ranges',{}).items():
         universe = universe[universe[metric].between(bounds[0],bounds[1],inclusive='both')].copy()
-    ranked = score(universe,tail=config.get('tail',20)) if config.get('rerank',False) and len(universe) else universe
-    # Unassigned rows have no score. A positive minimum intentionally excludes them.
+    ranked = score(universe,tail=config.get('tail',20),buy_rules=rules) if config.get('rerank',False) and len(universe) else universe
+    ranked['investment_conclusion'] = pd.Series([conclusion(r,config) for _,r in ranked.iterrows()],index=ranked.index,dtype=str)
     view = ranked[ranked.classification.isin(config['classes'])].copy()
+    query = config.get('search','').strip()
+    if query:
+        view = view[view.ticker.fillna('').str.contains(query,case=False,regex=False) |
+                    view.company_name.fillna('').str.contains(query,case=False,regex=False)].copy()
     minimum = config.get('min_score',0)
     if minimum > 0:
         view = view[view.overall_score.ge(minimum)].copy()
-    view = view.sort_values(['overall_score','ticker'],ascending=[False,True],na_position='last')
-    return view, ranked
+    return view.sort_values(['overall_score','ticker'],ascending=[False,True],na_position='last'), ranked
 
 
 from pathlib import Path
@@ -136,6 +171,8 @@ def unassigned_explanation(row):
     missing = [METRICS[k][0] for k in METRICS if pd.isna(row.get(k))]
     original = str(row.get('eligibility_reason', ''))
     reasons = []
+    if 'assignment exclusion' in original:
+        reasons.append('Crocs is excluded because it was used for the 60-second pitch.')
     if 'financial company' in original:
         reasons.append('Financial company: a separate scoring model is required.')
     if 'nonpositive book equity' in original:
@@ -148,7 +185,9 @@ def unassigned_explanation(row):
         reasons.append('Too few eligible sector peers: at least five are required for comparison.')
     if 'sector unavailable' in original:
         reasons.append('Sector unavailable: the comparison group cannot be identified.')
-    if 'financial company' in original:
+    if 'assignment exclusion' in original:
+        primary = 'Assignment exclusion: pitch company'
+    elif 'financial company' in original:
         primary = 'Separate financial-sector model'
     elif 'nonpositive book equity' in original:
         primary = 'Nonpositive book equity'
@@ -171,7 +210,7 @@ def unassigned_explanation(row):
 
 
 ROOT=Path(__file__).resolve().parent
-st.set_page_config(page_title='Long / Short Lab',page_icon='📊',layout='wide')
+st.set_page_config(page_title='Long Analysis Lab',page_icon='📊',layout='wide')
 
 
 @st.cache_data
@@ -185,7 +224,8 @@ baseline=score(data)
 
 
 def defaults():
-    return dict(sectors=sectors,search='',ranges={},classes=CLASSES,min_score=0,tail=20,rerank=False)
+    return dict(sectors=sectors,search='',ranges={},classes=CLASSES,min_score=0,tail=20,rerank=False,
+                buy_rules=dict(valuation=50,profitability=50,strength=40,positive=True))
 
 
 def filter_key(name):
@@ -204,57 +244,62 @@ if 'applied' not in st.session_state:
     st.session_state.applied=defaults()
 
 with st.sidebar:
-    st.title('Screen companies')
-    st.caption('Choose your criteria, then apply them to update the list.')
+    st.title('Long screening criteria')
+    st.caption('Changes update the screening results immediately.')
     st.button('Reset filters',on_click=reset,width='stretch')
-    with st.form('filters'):
-        selected_sectors=st.multiselect('Sectors',sectors,default=sectors,key=filter_key('sectors'))
-        search=st.text_input('Company or ticker',key=filter_key('search'),placeholder='e.g. Apple or AAPL')
-        classes=st.multiselect('Show classifications',CLASSES,default=CLASSES,key=filter_key('classes'))
-        minimum=st.slider('Minimum overall score',0,100,0,key=filter_key('score'))
-        st.caption('A minimum above zero also excludes unassigned companies.')
-        ranges={}
-        with st.expander('Class metric filters'):
-            st.caption('Enable a metric, then enter its accepted range. Enabled filters exclude missing values. Percentage fields use percentage points: enter 10 for 10%.')
-            for metric,(label,scale,helptext) in METRICS.items():
-                values=baseline[metric].dropna()*scale
-                if values.empty:
-                    continue
-                enabled=st.checkbox(label,key=filter_key('enabled_'+metric),help=helptext)
-                low_default=float(math.floor(values.min()*100)/100)
-                high_default=float(math.ceil(values.max()*100)/100)
-                left,right=st.columns(2)
-                low=left.number_input('Minimum',value=low_default,format='%.2f',key=filter_key('low_'+metric))
-                high=right.number_input('Maximum',value=high_default,format='%.2f',key=filter_key('high_'+metric))
-                if enabled:
-                    ranges[metric]=(low/scale,high/scale)
-        with st.expander('Ranking options'):
-            tail=st.slider('Long / short tail size (%)',5,40,20,key=filter_key('tail'),help='Top tail = long candidates; bottom tail = short candidates. Applied within each sector.')
-            rerank=st.checkbox('Recalculate within filtered companies',key=filter_key('rerank'))
-            st.caption('Off: keep the original sector comparison. On: rebuild sector ranks after sector, company-name and metric filters. Classification and minimum-score filters apply last. At least five eligible sector peers are required.')
-        submitted=st.form_submit_button('Apply filters',type='primary',width='stretch')
-    if submitted:
-        if any(low>high for low,high in ranges.values()):
-            st.error('Each minimum must be less than or equal to its maximum. Previous results are retained.')
-        else:
-            st.session_state.applied=dict(sectors=selected_sectors,search=search,ranges=ranges,
-                classes=classes,min_score=minimum,tail=tail,rerank=rerank)
+    selected_sectors=st.multiselect('Sectors',sectors,default=sectors,key=filter_key('sectors'))
+    search=st.text_input('Company or ticker',key=filter_key('search'),placeholder='e.g. Apple or AAPL')
+    classes=st.multiselect('Show classifications',CLASSES,default=CLASSES,key=filter_key('classes'))
+    minimum=st.slider('Minimum overall score',0,100,0,key=filter_key('score'))
+    st.caption('A minimum above zero excludes companies without a score.')
+    with st.expander('Long candidate requirements',expanded=True):
+        tail=st.slider('Top of each sector (%)',5,40,20,key=filter_key('tail'))
+        val_min=st.slider('Minimum valuation score',0,100,50,key=filter_key('valuation'))
+        profit_min=st.slider('Minimum profitability score',0,100,50,key=filter_key('profitability'))
+        strength_min=st.slider('Minimum financial strength score',0,100,40,key=filter_key('strength'))
+        positive=st.checkbox('Require positive earnings yield and after-tax ROC',value=True,key=filter_key('positive'))
+        st.caption('A long candidate must meet every requirement. Category scores are sector-relative, on a 0–100 scale.')
+    ranges={}
+    invalid=False
+    with st.expander('Class metric filters'):
+        st.caption('Enable a metric and enter its accepted range. Percentage fields use percentage points: enter 10 for 10%. Missing values fail enabled filters.')
+        for metric,(label,scale,helptext) in METRICS.items():
+            values=baseline[metric].dropna()*scale
+            if values.empty:
+                continue
+            enabled=st.checkbox(label,key=filter_key('enabled_'+metric),help=helptext)
+            left,right=st.columns(2)
+            low=left.number_input('Minimum',value=float(math.floor(values.min()*100)/100),format='%.2f',key=filter_key('low_'+metric))
+            high=right.number_input('Maximum',value=float(math.ceil(values.max()*100)/100),format='%.2f',key=filter_key('high_'+metric))
+            if enabled:
+                ranges[metric]=(low/scale,high/scale)
+                invalid |= low>high
+    with st.expander('Ranking options'):
+        rerank=st.checkbox('Recalculate within filtered companies',key=filter_key('rerank'))
+        st.caption('Off: compare against the original sector peers. On: rebuild scores after sector and metric filters, requiring five eligible peers per sector. Search and display filters never change the comparison group.')
+    if invalid:
+        st.error('Each enabled minimum must be at or below its maximum. The previous valid results are retained.')
+    else:
+        st.session_state.applied=dict(sectors=selected_sectors,search=search,ranges=ranges,
+            classes=classes,min_score=minimum,tail=tail,rerank=rerank,
+            buy_rules=dict(valuation=val_min,profitability=profit_min,strength=strength_min,positive=positive))
 
 config=st.session_state.applied
 view,universe=run_screen(data,config)
 
-st.title('Long / Short Lab')
-st.write('Explore 500 companies using the financial metrics from ACCT 3343.')
+st.title('Long Analysis Lab')
+st.write('Identify potential BUY candidates through valuation, profitability, earnings quality, and financial strength.')
+st.caption('ACCT 3343 · Long Analysis App · Crocs (CROX) is excluded because it was used for the 60-second pitch.')
 st.caption('Annual financial statements · Market-data snapshot: October 16, 2026 · Research screening candidates')
 
-cols=st.columns(5)
+cols=st.columns(4)
 cols[0].metric('Companies shown',len(view))
-for col,label,title in zip(cols[1:],CLASSES,['Long candidates','Short candidates','Neutral','Not assigned']):
+for col,label,title in zip(cols[1:],CLASSES,['Long candidates','Do not meet criteria','Not assigned']):
     col.metric(title,int(view.classification.eq(label).sum()))
 
 mode='Recalculated within filtered companies' if config['rerank'] else 'Original sector rankings'
-st.caption(f"Applied: {len(config['sectors'])} sectors · {len(config['ranges'])} metric filters · {mode} · Top/bottom {config['tail']}%")
-results_tab,detail_tab,unassigned_tab,method_tab=st.tabs(['Company list','Company detail','Unassigned companies','How scoring works'])
+st.caption(f"Applied: {len(config['sectors'])} sectors · {len(config['ranges'])} metric filters · {mode} · Top {config['tail']}% per sector")
+results_tab,detail_tab,unassigned_tab,method_tab=st.tabs(['Company list','Long investment analysis','Unassigned companies','Methodology and formulas'])
 
 with results_tab:
     if view.empty:
@@ -263,7 +308,7 @@ with results_tab:
         st.caption('Click a column heading to sort. Not assigned means the model could not classify the company; see its eligibility explanation.')
         chosen=st.multiselect('Additional columns',list(METRICS),default=['gpa','sta','snoa','z_score_class','f_score_class_net_corrected_roa'],
             format_func=lambda k:METRICS[k][0])
-        base=['ticker','company_name','sector','classification','overall_score','sector_rank',
+        base=['ticker','company_name','sector','classification','investment_conclusion','overall_score','sector_rank',
               'valuation_score','profitability_score','earnings_quality_score','financial_strength_score']
         display=view[base+chosen+['eligibility_reason','review_flags','period_end']].copy()
         col_config={
@@ -280,10 +325,10 @@ with results_tab:
             col_config[metric]=st.column_config.NumberColumn(label,format='%.2f',help=helptext)
         st.dataframe(display,column_config=col_config,hide_index=True,width='stretch',height=520)
         st.download_button('Download this company list (CSV)',view.to_csv(index=False).encode('utf-8'),
-            file_name='filtered_companies.csv',mime='text/csv')
+            file_name='long_analysis_companies.csv',mime='text/csv')
         st.caption('CSV exports keep the original decimal units: 0.10 means 10%.')
     st.download_button('Download applied filter settings',json.dumps(config,indent=2).encode(),
-        file_name='filter_settings.json',mime='application/json')
+        file_name='long_analysis_settings.json',mime='application/json')
 
 with detail_tab:
     if view.empty:
@@ -299,6 +344,17 @@ with detail_tab:
             chart=pd.DataFrame({'Category':['Valuation','Profitability','Earnings quality','Financial strength'],
                 'Score':[row[g+'_score'] for g in ['valuation','profitability','earnings_quality','financial_strength']]}).set_index('Category')
             st.bar_chart(chart,y='Score',horizontal=True)
+        st.subheader('Investment conclusion under the active criteria')
+        st.write(row['investment_conclusion'])
+        if row['eligible']:
+            st.dataframe(checks_for(row,config),hide_index=True,width='stretch')
+            evidence=[]
+            for metric,(label,scale,helptext) in METRICS.items():
+                evidence.append((row[metric+'_percentile'],label,row[metric]*scale))
+            evidence.sort(reverse=True)
+            st.markdown('**Strongest relative signals:** '+ '; '.join(f'{name}: {value:,.2f} (favorable percentile {pct:.1f})' for pct,name,value in evidence[:3])+'.')
+            st.markdown('**Signals to scrutinize:** '+ '; '.join(f'{name}: {value:,.2f} (favorable percentile {pct:.1f})' for pct,name,value in reversed(evidence[-3:]))+'.')
+            st.caption('These are relative strengths and weaknesses within the comparison group, not evidence of future price gains. Check business prospects, debt obligations, recent filings, and the reason behind any unusual accounting figures before reaching a final investment decision.')
         values=[]
         for metric,(label,scale,helptext) in METRICS.items():
             value=row[metric]
@@ -310,7 +366,7 @@ with detail_tab:
 
 with unassigned_tab:
     st.subheader('Why companies are not assigned')
-    st.write('A company is not assigned when the model does not have enough usable data or the company needs a different scoring treatment. This is not a short recommendation or evidence of poor performance.')
+    st.write('A company is not assigned when the model does not have enough usable data or the company needs a different scoring treatment. This does not establish whether the company is a good or bad investment.')
     st.caption('This view covers the full 500-company dataset using the original sector comparison. Use the filters below; the sidebar filters apply to Company list and Company detail.')
     unassigned_rows = baseline.loc[baseline.classification.eq('Not assigned')]
     explanations = pd.DataFrame([unassigned_explanation(row) for _,row in unassigned_rows.iterrows()])
@@ -319,7 +375,7 @@ with unassigned_tab:
     summary_cols[1].metric('With insufficient data', int(explanations['Data status'].eq('Insufficient data').sum()))
     summary_cols[2].metric('Complete metrics, other blocker', int(explanations['Data status'].eq('Complete metric data').sum()))
     with st.expander('What does insufficient data mean?', expanded=True):
-        st.markdown('**Insufficient data** means at least one of the 11 required metrics is unavailable or cannot be calculated under the current rules. It does not mean the metric is zero or that the company is a bad investment.\n\nExamples include missing statement fields, an incomplete F-score, too little annual history, an undefined margin-growth rate, or a tax/capital denominator that prevents after-tax ROC. Some companies also have a separate eligibility issue.\n\nOther reasons for no assignment include a financial-sector business requiring its own model, nonpositive book equity, outdated financial statements, or fewer than five eligible sector peers.')
+        st.markdown('**Insufficient data** means at least one of the 11 required metrics is unavailable or cannot be calculated under the current rules. It does not mean the metric is zero or that the company is a bad investment.\n\nExamples include missing statement fields, an incomplete F-score, too little annual history, an undefined margin-growth rate, or a tax/capital denominator that prevents after-tax ROC. Some companies also have a separate eligibility issue.\n\nCrocs is excluded by the assignment restriction. Other reasons for no assignment include a financial-sector business requiring its own model, nonpositive book equity, outdated financial statements, or fewer than five eligible sector peers.')
     filters_left, filters_right = st.columns(2)
     data_status = filters_left.selectbox('Data availability', ['All', 'Insufficient data', 'Complete metric data'], key='unassigned_status')
     reason = filters_right.selectbox('Primary reason', ['All'] + sorted(explanations['Primary reason'].unique().tolist()), key='unassigned_reason')
@@ -351,36 +407,87 @@ with unassigned_tab:
         st.download_button('Download unassigned company explanations',shown.to_csv(index=False).encode('utf-8'),file_name='unassigned_explanations.csv',mime='text/csv')
 
 with method_tab:
-    st.markdown('''
-Each eligible company is compared with companies in the same sector. Metric
-percentiles run from 0 to 100, with higher scores always favorable. Lower STA
-and SNOA receive higher scores.
+    st.markdown("""
+### Long investment approach
+Look for attractive valuation supported by profitability, cash generation, earnings quality,
+and financial strength. A potential BUY must be eligible, fall within the selected top sector
+percentile, and pass every selected category requirement and positive-return requirement.
+The default requirements are top 20%, valuation ≥50, profitability ≥50, financial strength ≥40,
+positive earnings yield, and positive after-tax ROC. These are transparent screening choices,
+not empirically validated return forecasts. Adjust them in the sidebar.
 
 | Category | Weight | Metrics |
 |---|---:|---|
 | Valuation | 25% | Book-to-market, class earnings yield |
-| Profitability | 25% | GPA, after-tax ROC, CFOA, margin growth, margin stability |
+| Profitability | 25% | GPA, after-tax ROC, class CFOA, margin growth, margin stability |
 | Earnings quality | 25% | STA, SNOA |
 | Financial strength | 25% | Class Z-score, class net-issuance F-score |
 
-Metrics receive equal weight within each category. All 11 must be available.
-Financial companies need a separate model. Nonpositive book equity, stale
-statements, or too few eligible sector peers also prevent assignment.
+Within each sector, metric scores = 100 × (average tied rank − 1)/(peer count − 1).
+Higher raw values are favorable except STA and SNOA, whose ranking direction is reversed.
+Each category averages its metric scores; overall score is the weighted sum of the four categories.
+The sector composite percentile ranks the overall scores again within the sector.
+Ties can cause the number of candidates to differ from the selected percentage.
 
-Long and short labels use the upper and lower tails of the **sector composite
-percentile**, with 20% tails by default. Ties and small samples affect counts.
-Neutral describes an eligible company in the middle; not assigned describes a
-company that does not meet the model's eligibility rules.
+**Eligibility:** All 11 metrics must be finite. Financial companies require another model.
+Nonpositive book equity, statements older than 550 days at collection, unavailable dates,
+or fewer than five eligible sector peers prevent assignment. Crocs is excluded from scoring
+and recommendations because it was used for the 60-second pitch. Missing values are never zero-filled.
 
-**Filtering versus recalculating:** Filtering keeps a company's original
-comparison group unless recalculation is enabled. With recalculation enabled,
-the selected company universe defines new within-sector percentiles. The
-classification and minimum-score filters are applied after ranking.
+**Interactive behavior:** Every valid change immediately reruns the screen and its conclusions.
+With original rankings, changing filters selects from fixed sector-relative scores.
+With recalculation enabled, sector and metric filters also rebuild the peer universe and scores.
+Company search, classification, and minimum overall score apply afterward, so searching one
+company does not erase its comparison group. The Unassigned tab always describes the full baseline dataset.
 
-Scores describe relative strength under these class metrics. They are not
-probabilities or forecasts of investment returns. This version uses a saved
-snapshot and does not request live prices.
-''')
+**Interpretation:** A company that does not qualify is not a sell recommendation.
+This app does not estimate a fair price, a price target, or an expected return; a high score
+identifies a company for further long investment research.
+
+### Data and calculation conventions
+The embedded dataset contains 500 companies collected with yfinance/Yahoo Finance on
+October 16, 2026. Financial statements are annual, using each company's latest available
+fiscal period; fiscal dates differ across companies. History metrics use three annual observations
+(two growth periods), with annual spacing checks. Valuation uses market capitalization at collection,
+combined with annual fundamentals; it is not historical fiscal-date valuation or a live market feed.
+The app recalculates ranks, eligibility, and conclusions from saved metric inputs. It does not fetch
+new statements or recompute raw financial-statement inputs when filters change.
+Minority interest was inferred for some missing observations using a nonnegative accounting
+identity; company-specific review flags identify these cases. Vendor coverage and accounting
+differences may affect comparisons. No backtest or transaction-cost analysis is included.
+
+| Metric | Calculation used |
+|---|---|
+| GPA | Gross profit / total assets |
+| Book-to-market | Common equity / snapshot market capitalization |
+| Class earnings yield | EBIT / class total enterprise value (TEV) |
+| Class TEV | Market capitalization + short- and long-term debt − excess cash + preferred equity + minority interest |
+| Class excess cash | Cash + current assets − current liabilities (literal class convention) |
+| After-tax ROC | EBIT × (1 − effective tax rate) / (debt + common equity − cash) |
+| Effective tax rate | Tax expense / pretax income; accepted only from 0 to 1 |
+| STA | (Net income − operating cash flow) / total assets |
+| SNOA | [(assets − cash) − (assets − debt − minority interest − preferred equity − common equity)] / assets |
+| Class CFOA | Sum of three years of free cash flow / latest total assets |
+| Free cash flow | Operating cash flow − absolute capital expenditures |
+| Gross margin | Gross profit / revenue |
+| Margin growth | (Latest gross margin / earliest gross margin)^(1/2) − 1; all three margins positive |
+| Margin stability | Mean annual gross margin / sample standard deviation of annual gross margins |
+
+Positive denominators are required for these financial ratios. Undefined calculations remain unavailable.
+Class CFOA here uses cumulative free cash flow, rather than a conventional one-year operating-cash-flow ratio.
+"""
+    )
     st.latex(r'Z=0.012X_1+0.014X_2+0.033X_3+0.006X_4+0.999X_5')
-    st.caption('X1: working capital/assets · X2: retained earnings/assets · X3: EBIT/assets · X4: market equity/total liabilities · X5: sales/assets. No standard distress-zone cutoffs are applied.')
-    st.caption('F-score uses positive change in ROA and net common issuance ≤ 0. Margin growth uses the geometric rate across two growth periods. Annual history: three years.')
+    st.caption('X1: working capital/assets · X2: retained earnings/assets · X3: EBIT/assets · X4: market equity/total liabilities · X5: sales/assets. Decimal inputs and the approved class coefficients are used. No standard distress-zone cutoffs are applied.')
+    st.markdown("""
+**Class F-score (0–9):** One point each for positive ROA, positive operating cash flow/assets,
+positive change in ROA, cash-flow return above ROA, declining long-term debt/assets,
+increasing current ratio, net common issuance ≤0, increasing gross margin, and increasing asset turnover.
+ROA, cash-flow return, and turnover use beginning assets. All nine signals must be available.
+
+**Reading the evidence:** Lower STA can support earnings quality when cash flows exceed earnings,
+but noncash write-downs can also lower STA. Lower SNOA is favorable under this model but does not
+establish undervaluation. High earnings yield or book-to-market can reflect business risks.
+Read the strongest and weakest signals together with the company's review flags and fiscal date.
+"""
+    )
